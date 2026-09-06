@@ -46,6 +46,89 @@ function runCli(args, port, env = {}, cwd = undefined) {
   return { child, result };
 }
 
+// Exercise the real subscription function with a fake socket and clock. No
+// process startup or real 30-second waits are needed to inspect the wire beats.
+function subscriptionHarness(channel) {
+  const source = require('node:fs').readFileSync(CLI, 'utf8');
+  const start = source.indexOf('function cableSubscribe(');
+  const end = source.indexOf('\n// Run one WS subscription session', start);
+  assert.ok(start >= 0 && end > start);
+  let now = 0;
+  let socket;
+  const timers = new Map();
+  const down = [];
+  const frames = [];
+  let up = 0;
+  class Socket {
+    constructor() { socket = this; this.readyState = 1; this.sent = []; }
+    send(frame) { this.sent.push(JSON.parse(frame)); }
+    close() { this.readyState = 3; }
+    receive(frame) { this.onmessage({ data: JSON.stringify(frame) }); }
+  }
+  const context = require('node:vm').createContext({
+    WebSocket: Socket, Date: { now: () => now },
+    setInterval(fn, interval) {
+      const timer = { fn, interval, next: now + interval, unref() {} };
+      timers.set(timer, timer); return timer;
+    },
+    clearInterval(timer) { timers.delete(timer); },
+  });
+  const subscribe = require('node:vm').runInContext(source.slice(start, end) + '\ncableSubscribe', context);
+  const subscription = subscribe({ channel, base: 'http://localhost', token: 'test',
+    onUp: () => up++, onFrame: (frame) => frames.push(frame), onDown: (why) => down.push(why) });
+  const tick = (ms) => {
+    const target = now + ms;
+    for (;;) {
+      const timer = [...timers.values()].filter((t) => t.next <= target).sort((a, b) => a.next - b.next)[0];
+      if (!timer) break;
+      now = timer.next; timer.next += timer.interval; timer.fn();
+    }
+    now = target;
+  };
+  socket.onopen();
+  const identifier = socket.sent[0].identifier;
+  return { socket, subscription, tick, timers, down, frames, identifier, get up() { return up; } };
+}
+
+for (const channel of ['ConversationChannel', 'InboxChannel']) {
+  test(`cable presence beats: ${channel} preserves transport liveness and frame delivery`, () => {
+    const h = subscriptionHarness(channel);
+    assert.equal(JSON.parse(h.identifier).channel, channel);
+    // Pings before confirmation do not start application beats.
+    for (let i = 0; i < 6; i++) { h.socket.receive({ type: 'ping' }); h.tick(5000); }
+    assert.equal(h.socket.sent.length, 1);
+    h.socket.receive({ type: 'confirm_subscription', identifier: h.identifier });
+    h.socket.receive({ type: 'confirm_subscription', identifier: h.identifier });
+    assert.equal(h.up, 2);
+    for (let i = 0; i < 12; i++) { h.socket.receive({ type: 'ping' }); h.tick(5000); }
+    const beats = h.socket.sent.filter((f) => f.command === 'message');
+    assert.equal(beats.length, channel === 'ConversationChannel' ? 2 : 0,
+      'only ConversationChannel renews presence, with no duplicate timer on reconfirm');
+    for (const beat of beats) {
+      assert.equal(beat.identifier, h.identifier);
+      assert.deepEqual(JSON.parse(beat.data), { action: 'beat' });
+    }
+    h.socket.receive({ identifier: h.identifier, message: { type: 'message', id: 7 } });
+    assert.equal(h.frames.length, 1);
+    assert.equal(h.frames[0].id, 7);
+    assert.equal(h.down.length, 0);
+    h.tick(20000); // Neither subscription can survive a silent transport.
+    assert.deepEqual(h.down, ['heartbeat lost (server gone?)']);
+    assert.equal(h.socket.readyState, 3);
+    assert.equal(h.timers.size, 0);
+  });
+
+  test(`cable close: ${channel} cancels all timers without reporting a failure`, () => {
+    const h = subscriptionHarness(channel);
+    h.socket.receive({ type: 'confirm_subscription', identifier: h.identifier });
+    h.subscription.close();
+    h.tick(60000);
+    assert.equal(h.timers.size, 0);
+    assert.equal(h.socket.sent.length, 1);
+    assert.equal(h.down.length, 0);
+  });
+}
+
 test('field report — wait= dying behind the edge (502): degrade to plain GETs, stay alive, deliver', async () => {
   const mock = createMock();
   const port = await mock.start();
@@ -2644,6 +2727,9 @@ test('skill teaches bridge, ack --summary, the PIDGE_AGENT block + the prose fix
   assert.match(skill, /pidge bridge/, 'the supervisor section names `pidge bridge`');
   assert.match(skill, /bridge --exec/, 'bridge --exec is taught');
   assert.match(skill, /bridge install/, 'bridge install is taught');
+  assert.match(skill, /Claude resumes within a day/);
+  assert.match(skill, /Codex\/Gemini start fresh with catchup/);
+  assert.doesNotMatch(skill, /a resumed model session that remembers earlier batches/);
   // ack --summary as a COMMAND, not just an effect
   assert.match(skill, /ack --up-to <id> --summary/, 'ack --summary shown as a command');
   // the multi-agent block, early and explicit

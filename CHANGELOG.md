@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.54.9 — 2026-09-05
+
+- Send application presence beats only on ConversationChannel, avoiding
+  unsupported InboxChannel actions. Transport ping monitoring stays active on
+  both channels.
+- Generated skill guidance now describes bridge continuity per runtime:
+  Claude resumes within the day; Codex and Gemini start fresh each batch and
+  recover context through the prompt's read-only catchup step.
+
 ## 0.54.8 — 2026-09-03
 
 **A printed body is drained before the process exits.** stdout on a PIPE is
